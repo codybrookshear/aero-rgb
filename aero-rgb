@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""Keyboard backlight control for the GIGABYTE AERO X16 (USB 0414:8104).
+
+The backlight is one RGB zone behind a standard HID LampArray ("Dynamic
+Lighting") interface. This tool drives it with HID feature reports, using only
+the Python standard library. It remembers the last setting, so `toggle` (bound
+to Fn+Space) can turn the light off and bring it back.
+
+Examples:
+  aero-rgb color ff8800              set the backlight color
+  aero-rgb color red --brightness 40
+  aero-rgb toggle                    off if on, back to the last setting if off
+  aero-rgb effect breathe --color cyan
+  aero-rgb effect cycle --speed 0.1
+  aero-rgb auto                      hand control back to the keyboard firmware
+  aero-rgb info                      show what the keyboard reports
+"""
+
+import argparse
+import colorsys
+import fcntl
+import json
+import math
+import os
+import signal
+import struct
+import sys
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+VENDOR_ID = 0x0414
+PRODUCT_ID = 0x8104
+# Usage Page (Lighting and Illumination), Usage (LampArray).
+LAMPARRAY_DESCRIPTOR_PREFIX = bytes.fromhex("05590901")
+UDEV_RULES_FILE = Path(__file__).resolve().with_name("60-gigabyte-aero-x16-kbd.rules")
+STATE_FILE = (
+    Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    / "aero-rgb" / "state.json"
+)
+
+# (report ID, length including the ID byte), from the keyboard's report descriptor.
+REPORT_ARRAY_ATTRIBUTES = (1, 23)
+REPORT_LAMP_REQUEST = (2, 3)
+REPORT_LAMP_RESPONSE = (3, 29)
+REPORT_RANGE_UPDATE = (5, 10)
+REPORT_CONTROL = (6, 2)
+
+FLAG_UPDATE_COMPLETE = 0x01
+HIDIOCSFEATURE = 0x06
+HIDIOCGFEATURE = 0x07
+
+OFF = (0, 0, 0)
+ARRAY_KINDS = {
+    1: "keyboard", 2: "mouse", 3: "game controller", 4: "peripheral", 5: "scene",
+    6: "notification", 7: "chassis", 8: "wearable", 9: "furniture", 10: "art",
+}
+PURPOSES = {
+    0x01: "control", 0x02: "accent", 0x04: "branding",
+    0x08: "status", 0x10: "illumination", 0x20: "presentation",
+}
+NAMED_COLORS = {
+    "white": (255, 255, 255), "red": (255, 0, 0), "green": (0, 255, 0),
+    "blue": (0, 0, 255), "yellow": (255, 255, 0), "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255), "orange": (255, 96, 0), "purple": (128, 0, 255),
+    "pink": (255, 40, 120),
+}
+
+
+@dataclass(frozen=True)
+class ArrayInfo:
+    lamp_count: int
+    width_um: int
+    height_um: int
+    depth_um: int
+    kind: int
+    min_update_interval_us: int
+
+
+@dataclass(frozen=True)
+class Lamp:
+    lamp_id: int
+    x_um: int
+    y_um: int
+    z_um: int
+    update_latency_us: int
+    purposes: int
+    red_levels: int
+    green_levels: int
+    blue_levels: int
+    intensity_levels: int
+    programmable: bool
+    input_binding: int
+
+
+@dataclass
+class State:
+    """The last setting, so toggle can restore it and a running effect can follow it."""
+
+    mode: str = "auto"  # "color", "effect", or "auto" (the firmware's own lighting)
+    on: bool = True
+    color: tuple = (255, 255, 255)
+    brightness: int = 100
+    effect_pid: int = 0
+
+    @classmethod
+    def load(cls):
+        try:
+            data = json.loads(STATE_FILE.read_text())
+            return cls(
+                mode=str(data["mode"]), on=bool(data["on"]), color=tuple(data["color"]),
+                brightness=int(data["brightness"]), effect_pid=int(data["effect_pid"]),
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return cls()
+
+    def save(self):
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        pending = STATE_FILE.with_suffix(f".{os.getpid()}.tmp")
+        pending.write_text(json.dumps(asdict(self)))
+        os.replace(pending, STATE_FILE)
+
+    @property
+    def effect_running(self):
+        if self.mode != "effect" or self.effect_pid <= 0:
+            return False
+        try:
+            # Check the command line too, in case the PID was reused.
+            return b"aero-rgb" in Path(f"/proc/{self.effect_pid}/cmdline").read_bytes()
+        except OSError:
+            return False
+
+
+def _hidioc(number, length):
+    # _IOC(_IOC_WRITE | _IOC_READ, 'H', number, length) from <linux/hidraw.h>.
+    return (3 << 30) | (length << 16) | (ord("H") << 8) | number
+
+
+def _scale(value, levels):
+    return round(value * levels / 255)
+
+
+def lamp_levels(lamp, rgb):
+    """Convert an 8-bit RGB color to the lamp's red/green/blue/intensity levels."""
+    red, green, blue = rgb
+    return (
+        _scale(red, lamp.red_levels),
+        _scale(green, lamp.green_levels),
+        _scale(blue, lamp.blue_levels),
+        lamp.intensity_levels,
+    )
+
+
+def dim(rgb, brightness):
+    return tuple(round(channel * brightness / 100) for channel in rgb)
+
+
+class Backlight:
+    """The keyboard's LampArray interface. Every lamp shows the same color."""
+
+    def __init__(self, path):
+        self.path = path
+        self._host_controlled = False
+        self._fd = os.open(path, os.O_RDWR)
+        try:
+            fields = struct.unpack_from("<xHIIIII", self._get_feature(REPORT_ARRAY_ATTRIBUTES))
+            self.info = ArrayInfo(*fields)
+            self.lamps = [self._read_lamp(lamp_id) for lamp_id in range(self.info.lamp_count)]
+            if not self.lamps:
+                raise OSError("the keyboard reports no lamps")
+        except BaseException:
+            os.close(self._fd)
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        os.close(self._fd)
+
+    def _get_feature(self, report):
+        report_id, length = report
+        buffer = bytearray(length)
+        buffer[0] = report_id
+        received = fcntl.ioctl(self._fd, _hidioc(HIDIOCGFEATURE, length), buffer)
+        if received < length:
+            raise OSError(f"feature report {report_id}: got {received} bytes, want {length}")
+        return bytes(buffer)
+
+    def _set_feature(self, data):
+        fcntl.ioctl(self._fd, _hidioc(HIDIOCSFEATURE, len(data)), bytes(data))
+
+    def _read_lamp(self, lamp_id):
+        self._set_feature(struct.pack("<BH", REPORT_LAMP_REQUEST[0], lamp_id))
+        fields = struct.unpack_from("<xHIIIIIBBBBBB", self._get_feature(REPORT_LAMP_RESPONSE))
+        lamp = Lamp(*fields[:-2], programmable=bool(fields[-2]), input_binding=fields[-1])
+        if lamp.lamp_id != lamp_id:
+            raise OSError(f"asked for lamp {lamp_id}, keyboard described lamp {lamp.lamp_id}")
+        return lamp
+
+    def set_autonomous(self, enabled):
+        """Enabled: the firmware runs its own lighting. Disabled: this tool sets the color."""
+        self._set_feature(struct.pack("<BB", REPORT_CONTROL[0], int(enabled)))
+        self._host_controlled = not enabled
+
+    def fill(self, rgb):
+        if not self._host_controlled:
+            self.set_autonomous(False)
+        self._set_feature(struct.pack(
+            "<BBHH4B", REPORT_RANGE_UPDATE[0], FLAG_UPDATE_COMPLETE,
+            0, len(self.lamps) - 1, *lamp_levels(self.lamps[0], rgb),
+        ))
+
+
+def _read_uevent(path):
+    fields = {}
+    for line in path.read_text().splitlines():
+        key, _, value = line.partition("=")
+        fields[key] = value
+    return fields
+
+
+def find_device():
+    for node in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        device = node / "device"
+        # HID_ID looks like 0003:00000414:00008104 (bus:vendor:product).
+        parts = _read_uevent(device / "uevent").get("HID_ID", "").split(":")
+        if len(parts) != 3 or (int(parts[1], 16), int(parts[2], 16)) != (VENDOR_ID, PRODUCT_ID):
+            continue
+        if (device / "report_descriptor").read_bytes().startswith(LAMPARRAY_DESCRIPTOR_PREFIX):
+            return f"/dev/{node.name}"
+    sys.exit("keyboard lighting interface not found (USB 0414:8104 with a HID LampArray)")
+
+
+def parse_color(text):
+    lowered = text.strip().lower()
+    if lowered in NAMED_COLORS:
+        return NAMED_COLORS[lowered]
+    hex_digits = lowered.removeprefix("#")
+    if len(hex_digits) == 6:
+        try:
+            return tuple(bytes.fromhex(hex_digits))
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(
+        f"bad color {text!r}: use a name ({', '.join(NAMED_COLORS)}) or hex like ff8800"
+    )
+
+
+def parse_percent(text):
+    value = int(text)
+    if not 0 <= value <= 100:
+        raise argparse.ArgumentTypeError("brightness must be 0-100")
+    return value
+
+
+def _hsv(hue):
+    return tuple(round(channel * 255) for channel in colorsys.hsv_to_rgb(hue % 1.0, 1.0, 1.0))
+
+
+def effect_cycle(args):
+    """Fade through the color wheel."""
+    return lambda elapsed: _hsv(elapsed * args.speed)
+
+
+def effect_breathe(args):
+    """Fade one color in and out."""
+    def color_at(elapsed):
+        level = (1 - math.cos(2 * math.pi * elapsed * args.speed)) / 2
+        return tuple(round(channel * level) for channel in args.color)
+    return color_at
+
+
+EFFECTS = {"cycle": effect_cycle, "breathe": effect_breathe}
+
+
+def stop_effect():
+    """Stop a running effect so it cannot overwrite the next setting."""
+    state = State.load()
+    if not state.effect_running:
+        return
+    try:
+        os.kill(state.effect_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 2
+    while state.effect_running and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
+def set_power(backlight, on):
+    state = State.load()
+    if state.mode == "auto" or (state.mode == "effect" and not state.effect_running):
+        state.mode = "color"
+    state.on = on
+    state.save()
+    if not on:
+        backlight.fill(OFF)
+    elif state.mode == "color":
+        backlight.fill(dim(state.color, state.brightness))
+    # A running effect picks up the change on its next frame.
+
+
+def _state_identity():
+    try:
+        stat = STATE_FILE.stat()
+    except OSError:
+        return None
+    # Saving replaces the file, so the inode changes even within one mtime tick.
+    return stat.st_ino, stat.st_mtime_ns
+
+
+def cmd_info(backlight, args):
+    info = backlight.info
+    print(f"device:              {backlight.path}")
+    print(f"kind:                {ARRAY_KINDS.get(info.kind, info.kind)}")
+    print(f"lamps:               {info.lamp_count}")
+    print(f"bounding box:        {info.width_um / 1000:.1f} x {info.height_um / 1000:.1f}"
+          f" x {info.depth_um / 1000:.1f} mm")
+    print(f"min update interval: {info.min_update_interval_us} us")
+    print()
+    print(f"{'id':>4}  {'x mm':>7} {'y mm':>7}  {'R/G/B/I levels':<16} {'prog':<5} purposes")
+    for lamp in backlight.lamps:
+        levels = f"{lamp.red_levels}/{lamp.green_levels}/{lamp.blue_levels}/{lamp.intensity_levels}"
+        purposes = ",".join(name for bit, name in PURPOSES.items() if lamp.purposes & bit) or "-"
+        print(f"{lamp.lamp_id:>4}  {lamp.x_um / 1000:>7.1f} {lamp.y_um / 1000:>7.1f}  {levels:<16}"
+              f" {'yes' if lamp.programmable else 'no':<5} {purposes}")
+
+
+def cmd_color(backlight, args):
+    stop_effect()
+    State(mode="color", color=args.color, brightness=args.brightness).save()
+    backlight.fill(dim(args.color, args.brightness))
+
+
+def cmd_on(backlight, args):
+    set_power(backlight, on=True)
+
+
+def cmd_off(backlight, args):
+    set_power(backlight, on=False)
+
+
+def cmd_toggle(backlight, args):
+    state = State.load()
+    if state.mode == "auto":
+        return  # The firmware handles Fn+Space itself while it runs its own lighting.
+    set_power(backlight, on=not state.on)
+
+
+def cmd_effect(backlight, args):
+    stop_effect()
+    state = State(mode="effect", color=args.color, brightness=args.brightness,
+                  effect_pid=os.getpid())
+    state.save()
+    color_at = EFFECTS[args.name](args)
+    interval = max(1.0 / args.fps, backlight.info.min_update_interval_us / 1e6)
+    watched = _state_identity()
+    lit = False
+    started = next_frame = time.monotonic()
+    while True:
+        identity = _state_identity()
+        if identity != watched:
+            watched, state = identity, State.load()
+        if state.on:
+            backlight.fill(dim(color_at(time.monotonic() - started), state.brightness))
+        elif lit:
+            # Covers a frame written just after `toggle` turned the light off.
+            backlight.fill(OFF)
+        lit = state.on
+        next_frame += interval
+        delay = next_frame - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        else:
+            next_frame = time.monotonic()  # Fell behind: skip ahead rather than burst.
+
+
+def cmd_auto(backlight, args):
+    stop_effect()
+    state = State.load()
+    state.mode, state.on = "auto", True
+    state.save()
+    backlight.set_autonomous(True)
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--device", help="hidraw node to use (default: find it by USB ID)")
+    brightness = argparse.ArgumentParser(add_help=False)
+    brightness.add_argument("--brightness", type=parse_percent, default=100, metavar="0-100",
+                            help="scale the color (default 100)")
+
+    parser = argparse.ArgumentParser(
+        prog="aero-rgb", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("info", parents=[common], help="show what the keyboard reports")
+
+    color = commands.add_parser("color", parents=[common, brightness], help="set the backlight color")
+    color.add_argument("color", type=parse_color, help="name or hex, e.g. red or ff8800")
+
+    commands.add_parser("on", parents=[common], help="restore the last color or effect")
+    commands.add_parser("off", parents=[common], help="turn the backlight off")
+    commands.add_parser("toggle", parents=[common], help="off if on, on if off (for Fn+Space)")
+
+    effect = commands.add_parser("effect", parents=[common, brightness],
+                                 help="run an animation until stopped")
+    effect.add_argument("name", choices=EFFECTS)
+    effect.add_argument("--speed", type=float, default=0.25, help="cycles per second (default 0.25)")
+    effect.add_argument("--color", type=parse_color, default=(255, 255, 255),
+                        help="color for breathe (default white)")
+    effect.add_argument("--fps", type=float, default=30, help="frame rate (default 30)")
+
+    commands.add_parser("auto", parents=[common], help="hand control back to the keyboard firmware")
+    return parser
+
+
+COMMANDS = {
+    "info": cmd_info, "color": cmd_color, "on": cmd_on, "off": cmd_off,
+    "toggle": cmd_toggle, "effect": cmd_effect, "auto": cmd_auto,
+}
+
+
+def main():
+    args = build_parser().parse_args()
+    # Let `stop_effect` and `systemctl stop` end an effect the same way Ctrl-C does.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    path = args.device or find_device()
+    try:
+        backlight = Backlight(path)
+    except PermissionError:
+        sys.exit(
+            f"no permission to open {path}. Allow your user to access the keyboard lighting with:\n"
+            f"  sudo cp {UDEV_RULES_FILE} /etc/udev/rules.d/\n"
+            "  sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw"
+        )
+    with backlight:
+        try:
+            COMMANDS[args.command](backlight, args)
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()

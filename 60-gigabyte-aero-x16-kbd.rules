@@ -1,0 +1,9 @@
+# GIGABYTE AERO X16 keyboard (USB 0414:8104): give the logged-in user its
+# lighting interface (HID LampArray, USB interface 4) and nothing else. The
+# keyboard's other interfaces carry keystrokes, so they stay root-only.
+#
+# Two rules because udev requires every parent-device match in one rule to hit
+# the same parent: the IDs are on the HID device, the interface number on its
+# parent USB interface.
+SUBSYSTEM=="hidraw", KERNELS=="0003:0414:8104.*", ENV{AERO_X16_KBD}="1"
+SUBSYSTEM=="hidraw", ENV{AERO_X16_KBD}=="1", ATTRS{bInterfaceNumber}=="04", TAG+="uaccess"
