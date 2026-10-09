@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+"""Translate the AERO X16's vendor Fn+Space reports into backlight toggles.
+
+Run as root to read the shared HID interface. Keyboard reports are discarded;
+the backlight command always runs as the specified unprivileged user.
+"""
+
+import argparse
+import os
+import pwd
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+# Vendor page FF02, report ID 4, three data bytes, on USB interface 2.
+VENDOR_REPORT_DESCRIPTOR = bytes.fromhex("0602ff0901a1018504")
+
+
+def is_fn_space(report):
+    # Report 4, notification type 1, brightness byte, zero flags. The brightness
+    # is payload, not a key identifier: captures include 0, 24, 32, and 50.
+    return len(report) == 4 and report[:2] == b'\x04\x01' and report[3] == 0
+
+
+def find_hotkey_device(root=Path('/sys/class/hidraw')):
+    for node in sorted(root.glob('hidraw*')):
+        device = node / 'device'
+        try:
+            fields = dict(line.split('=', 1) for line in
+                          (device / 'uevent').read_text().splitlines() if '=' in line)
+            if fields.get('HID_ID') != '0003:00000414:00008104':
+                continue
+            if (device.resolve().parent / 'bInterfaceNumber').read_text().strip() != '02':
+                continue
+            if VENDOR_REPORT_DESCRIPTOR in (device / 'report_descriptor').read_bytes():
+                return Path('/dev') / node.name
+        except FileNotFoundError:
+            continue  # The device may disappear during enumeration.
+    raise OSError('AERO X16 hotkey interface not found')
+
+
+def toggle_as_user(user, command):
+    # Never execute a user-owned command as root, or inherit root's state path.
+    return subprocess.run(
+        [str(command), 'toggle'], check=False, stdin=subprocess.DEVNULL,
+        user=user.pw_uid, group=user.pw_gid,
+        extra_groups=os.getgrouplist(user.pw_name, user.pw_gid),
+        env={'HOME': user.pw_dir, 'USER': user.pw_name, 'LOGNAME': user.pw_name,
+             'PATH': '/usr/local/bin:/usr/bin:/bin'},
+    ).returncode
+
+
+def listen(device, on_toggle):
+    with open(device, 'rb', buffering=0) as source:
+        print(f'Listening for Fn+Space on {device}', flush=True)
+        while True:
+            report = source.read(256)
+            if not report:
+                raise OSError('keyboard disconnected')
+            if is_fn_space(report):
+                started = time.monotonic()
+                result = on_toggle()
+                elapsed_ms = (time.monotonic() - started) * 1000
+                if result == 0:
+                    print(f'Fn+Space: level={report[2]} toggle dispatched '
+                          f'({elapsed_ms:.0f} ms)', flush=True)
+                else:
+                    print(f'Fn+Space: level={report[2]} toggle failed '
+                          f'(exit {result}, {elapsed_ms:.0f} ms)',
+                          file=sys.stderr, flush=True)
+            elif len(report) == 4 and report[:2] == b'\x04\x01':
+                # Only this vendor notification is logged, never keyboard data.
+                print(f'Ignored vendor brightness notification: '
+                      f'level={report[2]} flags={report[3]}', flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--user', required=True, help='user whose backlight state to toggle')
+    parser.add_argument('--command', type=Path, default=Path('/usr/local/bin/aero-rgb'),
+                        help='absolute path to aero-rgb (executed as --user)')
+    args = parser.parse_args()
+    user = pwd.getpwnam(args.user)
+    if user.pw_uid == 0:
+        parser.error('--user must be an unprivileged user')
+    if not args.command.is_absolute():
+        parser.error('--command must be an absolute path')
+    if os.geteuid() != 0:
+        parser.error('run this listener through the system service, as root')
+    try:
+        listen(find_hotkey_device(), lambda: toggle_as_user(user, args.command))
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.exit(str(exc))
+
+
+if __name__ == '__main__':
+    main()

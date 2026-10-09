@@ -3,8 +3,8 @@
 
 The backlight is one RGB zone behind a standard HID LampArray ("Dynamic
 Lighting") interface. This tool drives it with HID feature reports, using only
-the Python standard library. It remembers the last setting, so `toggle` (bound
-to Fn+Space) can turn the light off and bring it back.
+the Python standard library. It remembers the last setting, so `toggle`
+can turn the light off and bring it back.
 
 Examples:
   aero-rgb color ff8800              set the backlight color
@@ -402,7 +402,7 @@ def build_parser():
 
     commands.add_parser("on", parents=[common], help="restore the last color or effect")
     commands.add_parser("off", parents=[common], help="turn the backlight off")
-    commands.add_parser("toggle", parents=[common], help="off if on, on if off (for Fn+Space)")
+    commands.add_parser("toggle", parents=[common], help="off if on, on if off")
 
     effect = commands.add_parser("effect", parents=[common, brightness],
                                  help="run an animation until stopped")

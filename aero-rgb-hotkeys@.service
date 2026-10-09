@@ -1,0 +1,20 @@
+[Unit]
+Description=AERO X16 Fn+Space backlight toggle for %i
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/aero-rgb-hotkeys --user %i
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

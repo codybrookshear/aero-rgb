@@ -1,5 +1,5 @@
-# GIGABYTE AERO X16 keyboard (USB 0414:8104): Fn+Space sends F20 (HID usage
-# 0x07006f), which the desktop keymap treats as microphone mute. Send PROG1
-# (XF86Launch1) instead, so a desktop shortcut can run `aero-rgb toggle`.
+# Legacy GIGABYTE AERO X16 keyboard (USB 0414:8104) remap: F20 (HID usage
+# 0x07006f) to PROG1 (XF86Launch1). Fn alone also triggers this key; do not
+# bind it to `aero-rgb toggle` as a Fn+Space shortcut. See README.md.
 evdev:input:b0003v0414p8104*
  KEYBOARD_KEY_7006f=prog1
